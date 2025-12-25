@@ -1,0 +1,1207 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/blog-actions.ts b/blog-actions.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6e78a60bde3a566b77392ff973f9320d2cff012
+--- /dev/null
++++ b/blog-actions.ts
+@@ -0,0 +1,1197 @@
++'use server';
++import 'dotenv/config';
++import 'server-only';
++
++import type { AppSettings, PublicationLog, WPCategory, WPAuthor, WordPressSite, AuthorProfile, SiteSyncData, WPPost } from '@/lib/types';
++import * as crypto from 'crypto';
++import { z } from 'zod';
++import { upsertAuthorProfiles, getAuthorProfiles, deleteAuthorProfilesBySiteId } from './author-actions';
++import { acquireLock, releaseLock, getPublicationState, updatePublicationState, PubState, getAvailableModels } from '@/lib/firestore-state';
++import { revalidateAdminPaths } from './revalidate';
++import { getInitializedAI } from '@/lib/genkit-client';
++import { getDb } from './db';
++import { genkit } from 'genkit';
++import { googleAI } from '@genkit-ai/google-genai';
++import { findRelevantContent } from './rag-actions';
++
++// --- Gestion des paramètres de l'application ---
++export async function getSettings(): Promise<AppSettings> {
++    const db = await getDb();
++    const settingsDoc = await db.collection('system').doc('settings').get();
++    if (!settingsDoc.exists) {
++        return {};
++    }
++    const settings = settingsDoc.data() as AppSettings;
++    
++    // Fallback to environment variables if not in DB
++    const envSettings = {
++        geminiApiKey: process.env.GEMINI_API_KEY,
++        youtubeApiKey: process.env.YOUTUBE_API_KEY,
++        googleCseApiKey: process.env.GOOGLE_CSE_API_KEY,
++        googleCseId: process.env.GOOGLE_CSE_ID,
++        cronSecret: process.env.CRON_SECRET,
++        firebaseClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
++        firebasePrivateKey: process.env.FIREBASE_PRIVATE_KEY,
++    };
++
++    return {
++        geminiApiKey: settings.geminiApiKey || envSettings.geminiApiKey,
++        youtubeApiKey: settings.youtubeApiKey || envSettings.youtubeApiKey,
++        googleCseApiKey: settings.googleCseApiKey || envSettings.googleCseApiKey,
++        googleCseId: settings.googleCseId || envSettings.googleCseId,
++        cronSecret: settings.cronSecret || envSettings.cronSecret,
++        selectedModel: settings.selectedModel,
++        firebaseClientEmail: settings.firebaseClientEmail || envSettings.firebaseClientEmail,
++        firebasePrivateKey: settings.firebasePrivateKey || envSettings.firebasePrivateKey,
++    };
++}
++
++
++// Helper to decode HTML entities
++function decodeHtmlEntities(text: string): string {
++    if (!text) return '';
++    return text
++        .replace(/&nbsp;/g, ' ')
++        .replace(/&lt;/g, '<')
++        .replace(/&gt;/g, '>')
++        .replace(/&quot;/g, '"')
++        .replace(/&apos;/g, "'")
++        .replace(/&amp;/g, '&');
++}
++
++async function safeParseJsonResponse(response: Response): Promise<any | null> {
++    try {
++        return await response.json();
++    } catch (error) {
++        return null;
++    }
++}
++
++function tryParseJsonBlock(text: string): string | null {
++    if (!text) return null;
++    const fencedMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
++    if (fencedMatch && fencedMatch[1]) {
++        return fencedMatch[1];
++    }
++    const looseMatch = text.match(/\{[\s\S]*\}/);
++    if (looseMatch) {
++        return looseMatch[0];
++    }
++    return null;
++}
++
++const settingsFormSchema = z.object({
++  geminiApiKey: z.string().optional(),
++  youtubeApiKey: z.string().optional(),
++  googleCseApiKey: z.string().optional(),
++  googleCseId: z.string().optional(),
++  cronSecret: z.string().optional(),
++  selectedModel: z.string().optional(),
++  firebaseClientEmail: z.string().optional(),
++  firebasePrivateKey: z.string().optional(),
++});
++
++export async function updateSettings(values: z.infer<typeof settingsFormSchema>) {
++  const validatedFields = settingsFormSchema.safeParse(values);
++
++  if (!validatedFields.success) {
++    return { error: "Invalid fields." };
++  }
++  
++  try {
++    const db = await getDb();
++    await db.collection('system').doc('settings').set(validatedFields.data, { merge: true });
++    
++    // Update environment variables for the current process for immediate effect
++    const newSettings = validatedFields.data;
++    if (newSettings.geminiApiKey) process.env.GEMINI_API_KEY = newSettings.geminiApiKey;
++    if (newSettings.youtubeApiKey) process.env.YOUTUBE_API_KEY = newSettings.youtubeApiKey;
++    if (newSettings.googleCseApiKey) process.env.GOOGLE_CSE_API_KEY = newSettings.googleCseApiKey;
++    if (newSettings.googleCseId) process.env.GOOGLE_CSE_ID = newSettings.googleCseId;
++    if (newSettings.cronSecret) process.env.CRON_SECRET = newSettings.cronSecret;
++    if (newSettings.firebaseClientEmail) process.env.FIREBASE_CLIENT_EMAIL = newSettings.firebaseClientEmail;
++    if (newSettings.firebasePrivateKey) process.env.FIREBASE_PRIVATE_KEY = newSettings.firebasePrivateKey;
++
++    revalidateAdminPaths(['/admin/settings', '/admin/models']);
++    return { success: "Settings updated successfully." };
++  } catch (error: any) {
++      console.error("Error updating settings:", error);
++      return { error: `Failed to update settings: ${error.message}` };
++  }
++}
++
++// --- Tests de connexion API ---
++
++export async function testGeminiApiKey(apiKey: string, modelId: string) {
++  const validation = z.object({
++      apiKey: z.string().min(1, 'API key is required.'),
++      modelId: z.string().min(1, 'A model must be selected.')
++  }).safeParse({apiKey, modelId});
++
++  if (!validation.success) {
++    const issues = validation.error.issues.map(i => i.message).join(' ');
++    return { success: false, error: `Invalid input: ${issues}` };
++  }
++
++  try {
++    const testAi = genkit({
++        plugins: [googleAI({ apiKey })],
++    });
++    await testAi.generate({
++      model: googleAI.model(modelId as any),
++      prompt: "Test",
++    });
++
++    return { success: true, message: 'Gemini API connection successful.' };
++  } catch (error: any) {
++    console.error("Gemini API test failed:", error);
++    let errorMessage = error.message || String(error);
++     if (errorMessage.includes('API key not valid')) {
++        errorMessage = `Gemini API test failed: The provided API key is not valid. Please check the key and try again.`;
++    }
++    if (errorMessage.includes('404')) {
++        errorMessage = `Gemini API test failed: Model '${modelId}' not found. It might be a preview model that has been retired or your key does not have access. Please try another model from the list.`;
++    }
++    return { success: false, error: `Gemini API test failed: ${errorMessage}` };
++  }
++}
++
++export async function testYoutubeApiKey(apiKey: string) {
++    const validation = z.string().min(1, 'API key is required.').safeParse(apiKey);
++    if (!validation.success) {
++        return { success: false, error: 'YouTube API key is missing.' };
++    }
++    try {
++        const response = await fetch(`https://www.googleapis.com/youtube/v3/search?part=snippet&q=google&maxResults=1&key=${apiKey}`, { cache: 'no-store' });
++        if (!response.ok) {
++            const errorData = await safeParseJsonResponse(response);
++            const message = errorData?.error?.message || response.statusText || 'Unknown error';
++            return { success: false, error: `YouTube API test failed: ${message}` };
++        }
++        return { success: true, message: 'YouTube API key is valid.' };
++    } catch (error: any) {
++        console.error("YouTube API test failed:", error);
++        return { success: false, error: `YouTube API test failed: ${error.message}` };
++    }
++}
++
++
++const cseSchema = z.object({
++    apiKey: z.string().min(1, 'API key is required.'),
++    cseId: z.string().min(1, 'CSE ID is required.'),
++});
++
++export async function testGoogleCse(apiKey: string, cseId: string) {
++    const validation = cseSchema.safeParse({ apiKey, cseId });
++    if (!validation.success) {
++        return { success: false, error: 'API Key and CSE ID are required.' };
++    }
++    try {
++        const response = await fetch(`https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cseId}&q=test`, { cache: 'no-store' });
++        if (!response.ok) {
++            const errorData = await safeParseJsonResponse(response);
++            const message = errorData?.error?.message || response.statusText || 'Unknown error';
++            return { success: false, error: `Google Custom Search test failed: ${message}` };
++        }
++        return { success: true, message: 'Google Custom Search API is configured correctly.' };
++    } catch (error: any) {
++        console.error("Google Custom Search test failed:", error);
++        return { success: false, error: `Google Custom Search test failed: ${error.message}` };
++    }
++}
++
++
++// --- Gestion des données des sites ---
++
++export async function getSites(): Promise<WordPressSite[]> {
++    const db = await getDb();
++    const sitesSnapshot = await db.collection('sites').get();
++    return sitesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as WordPressSite));
++}
++
++export async function getSite(id: string): Promise<WordPressSite | undefined> {
++    const db = await getDb();
++    const siteDoc = await db.collection('sites').doc(id).get();
++    if (!siteDoc.exists) return undefined;
++    return { id: siteDoc.id, ...siteDoc.data() } as WordPressSite;
++}
++
++const siteFormSchema = z.object({
++  id: z.string().optional(),
++  name: z.string().min(1, 'Site name is required.'),
++  url: z.string().url('Please enter a valid URL.'),
++  username: z.string().min(1, 'Username is required.'),
++  applicationPassword: z.string().min(1, 'Application password is required.'),
++  niche: z.string().min(1, 'Niche is required.'),
++  customPrompt: z.string().optional(),
++  isActive: z.boolean().default(true),
++});
++
++
++export async function createSite(values: z.infer<typeof siteFormSchema>) {
++    const validatedFields = siteFormSchema.safeParse(values);
++
++    if (!validatedFields.success) {
++        return { error: 'Invalid fields.' };
++    }
++
++    try {
++        const db = await getDb();
++        const { id, ...siteData } = validatedFields.data;
++        const docRef = await db.collection('sites').add(siteData);
++        revalidateAdminPaths(['/admin/sites']);
++        return { success: 'Site created successfully.', id: docRef.id };
++    } catch (error: any) {
++        console.error("Error creating site:", error);
++        return { error: `Failed to create site: ${error.message}` };
++    }
++}
++
++export async function updateSite(values: z.infer<typeof siteFormSchema>) {
++    const validatedFields = siteFormSchema.safeParse(values);
++
++    if (!validatedFields.success) {
++        return { error: 'Invalid fields.' };
++    }
++
++    const { id, ...siteData } = validatedFields.data;
++
++    if (!id) {
++        return { error: 'Site ID is missing.' };
++    }
++
++    try {
++        const db = await getDb();
++        await db.collection('sites').doc(id).set(siteData, { merge: true });
++        revalidateAdminPaths([`/admin/sites/${id}`, `/admin/sites/${id}/edit`, '/admin/sites']);
++        return { success: 'Site updated successfully.' };
++    } catch (error: any) {
++        console.error(`Error updating site ${id}:`, error);
++        return { error: `Failed to update site: ${error.message}` };
++    }
++}
++
++export async function deleteSite(siteId: string) {
++    if (!siteId) {
++        return { error: 'Site ID is missing.' };
++    }
++
++    try {
++        const db = await getDb();
++        await db.collection('sites').doc(siteId).delete();
++
++        try {
++            await deleteAuthorProfilesBySiteId(siteId);
++            console.log(`[deleteSite] Successfully cleaned up author profiles for deleted site: ${siteId}`);
++        } catch (error: any) {
++            console.error(`[deleteSite] Failed to clean up author profiles for site ${siteId}: ${error.message}`);
++        }
++
++        revalidateAdminPaths(['/admin/sites', '/admin/sites/[id]/authors']);
++        return { success: 'Site deleted successfully.' };
++    } catch (error: any) {
++        console.error(`Error deleting site ${siteId}:`, error);
++        return { error: `Failed to delete site: ${error.message}` };
++    }
++}
++
++
++// --- Tests de connexion ---
++const connectionTestSchema = z.object({
++  url: z.string().url(),
++  username: z.string(),
++  applicationPassword: z.string(),
++});
++
++export async function testSiteConnectionWithValues(values: z.infer<typeof connectionTestSchema>) {
++  'use server';
++  console.log('[Connection Test] Starting test with values:', values);
++  const validation = connectionTestSchema.safeParse(values);
++  if (!validation.success) {
++    return { success: false, error: 'Invalid connection values.' };
++  }
++  const { url, username, applicationPassword } = validation.data;
++  const requestUrl = `${url.replace(/\/+$/, '')}/wp-json/wp/v2/users/me?context=edit`;
++  console.log(`[Connection Test] Testing URL: ${requestUrl}`);
++  console.log(`[Connection Test] Username: ${username}`);
++
++  try {
++    const response = await fetch(requestUrl, {
++      headers: {
++        'Authorization': `Basic ${Buffer.from(`${username}:${applicationPassword}`).toString('base64')}`
++      },
++      cache: 'no-store'
++    });
++
++    console.log(`[Connection Test] Response Status: ${response.status}`);
++    console.log(`[Connection Test] Response OK: ${response.ok}`);
++    console.log(`[Connection Test] Response Status Text: ${response.statusText}`);
++
++    if (!response.ok) {
++      let errorBody;
++      try {
++        errorBody = await response.json();
++        console.log('[Connection Test] Error Body (JSON):', JSON.stringify(errorBody, null, 2));
++      } catch (e) {
++        const errorText = await response.text();
++        console.log('[Connection Test] Error Body (Text):', errorText);
++        return { success: false, error: `Failed to connect or parse error response. Status: ${response.status} ${response.statusText}. Response: ${errorText}` };
++      }
++
++      if (errorBody && errorBody.code === 'rest_application_password_not_found') {
++        return { success: false, error: 'Authentication failed. Check username and application password. The password provided is not a valid application password.' };
++      }
++       if (errorBody && errorBody.code === 'rest_cannot_edit') {
++        return { success: false, error: 'Authentication successful, but the user does not have permission to edit users. Please grant the necessary permissions.' };
++      }
++
++      const errorMessage = errorBody?.message || response.statusText || `HTTP error! status: ${response.status}`;
++      return { success: false, error: `Failed to connect: ${errorMessage}` };
++    }
++
++    const data = await response.json();
++    console.log('[Connection Test] Success Data:', data);
++    return { success: true, message: `Connection successful for user: ${data.name}.` };
++
++  } catch (error: any) {
++    console.error("[Connection Test] Full Fetch Error:", error);
++    if (error instanceof TypeError && (error.message.includes('fetch failed') || error.message.includes('dns') || error.message.includes('ECONNREFUSED'))) {
++        return { success: false, error: `Network Error: Could not connect to ${url}. This might be a DNS issue, or the WordPress host firewall may be blocking requests from this server. Please verify the URL and check your hosting provider's security settings.` };
++    }
++    return { success: false, error: `Failed to connect: An unexpected error occurred. ${error.message}` };
++  }
++}
++
++export async function testSiteConnection(siteId: string) {
++  'use server';
++  const site = await getSite(siteId);
++  if (!site) {
++    return { success: false, error: 'Site not found' };
++  }
++
++  return testSiteConnectionWithValues(site);
++}
++
++// --- Synchronisation Wordpress ---
++
++// Helper for fetch with retry
++async function fetchWithRetry(url: string, options: RequestInit, retries = 3, delay = 5000): Promise<Response> {
++    for (let i = 0; i < retries; i++) {
++        try {
++            console.log(`[Fetch] Attempt ${i + 1} for ${url}`);
++            const response = await fetch(url, options);
++            if (response.ok) return response;
++            
++            console.warn(`[Fetch Retry] Attempt ${i + 1} for ${url} failed with status ${response.status}.`);
++
++            if (response.status >= 400 && response.status < 500) {
++                 const errorBody = await safeParseJsonResponse(response);
++                 const errorMessage = errorBody?.message || response.statusText;
++                 console.error(`[Fetch] Client error for ${url}: ${response.status} - ${errorMessage}`);
++                 throw new Error(`Client error: ${response.status} - ${errorMessage}`);
++            }
++             
++        } catch (error: any) {
++            console.error(`[Fetch Retry] Attempt ${i + 1} for ${url} failed. Error:`, error.message);
++            if (i === retries - 1) {
++                if (error instanceof TypeError && (error.message.includes('fetch failed') || error.message.includes('dns'))) {
++                    throw new Error(`Network error: Could not reach the server at ${url}. This is often caused by a firewall on the WordPress host blocking requests.`);
++                }
++                throw error;
++            }
++            await new Promise(res => setTimeout(res, delay * (i + 1)));
++        }
++    }
++    throw new Error(`Failed to fetch ${url} after ${retries} attempts.`);
++}
++
++export async function siteSync(siteId: string): Promise<{ success: boolean; data?: SiteSyncData, error?: string; }> {
++  'use server';
++  console.log(`[siteSync] Sync started for siteId: ${siteId}`);
++  const site = await getSite(siteId);
++  if (!site) {
++    console.error(`[siteSync] Sync failed: Site not found for siteId: ${siteId}`);
++    return { success: false, error: 'Site not found' };
++  }
++
++  try {
++    const headers = {
++      'Authorization': `Basic ${Buffer.from(`${site.username}:${site.applicationPassword}`).toString('base64')}`
++    };
++    const fetchOptions: RequestInit = { headers, cache: 'no-store' };
++
++    const categoriesUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/categories?per_page=100`;
++    const authorsUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/users?roles=administrator,editor,author&context=edit`;
++    
++    console.log(`[siteSync] Fetching categories from: ${categoriesUrl}`);
++    console.log(`[siteSync] Fetching authors from: ${authorsUrl}`);
++
++    const [categoriesResponse, authorsResponse] = await Promise.all([
++      fetchWithRetry(categoriesUrl, fetchOptions),
++      fetchWithRetry(authorsUrl, fetchOptions)
++    ]);
++    
++    console.log(`[siteSync] Categories response status: ${categoriesResponse.status}`);
++    console.log(`[siteSync] Authors response status: ${authorsResponse.status}`);
++
++    const categories: WPCategory[] = await categoriesResponse.json();
++    const authors: WPAuthor[] = await authorsResponse.json();
++
++    console.log(`[siteSync] Received ${categories?.length ?? 0} categories.`);
++    console.log(`[siteSync] Received ${authors?.length ?? 0} authors.`);
++
++    if (authors && authors.length > 0) {
++      const authorProfilesToUpsert = authors.map(author => ({
++        ...author,
++        siteId: site.id,
++      }));
++      await upsertAuthorProfiles(authorProfilesToUpsert);
++      console.log(`[siteSync] Upserted ${authorProfilesToUpsert.length} author profiles.`);
++    } else {
++        console.log('[siteSync] No authors found or received empty array for authors. Skipping author upsert.');
++    }
++
++    const result: SiteSyncData = {
++      siteId: site.id,
++      categories: Array.isArray(categories) ? categories.map(cat => ({ id: cat.id, name: cat.name, count: cat.count, slug: cat.slug })) : [],
++      authors: Array.isArray(authors) ? authors.map(author => ({ id: author.id, name: author.name, slug: author.slug })) : []
++    };
++    
++    console.log(`[siteSync] Sync successful for siteId: ${siteId}`);
++    return { success: true, data: result };
++
++  } catch (error: any) {
++     console.error(`[siteSync] Sync failed for site ${site.name}:`, error);
++    return { success: false, error: `Sync failed: ${error.message}` };
++  }
++}
++
++// --- Gestion des logs ---
++export async function getLogs(): Promise<PublicationLog[]> {
++    const db = await getDb();
++    const snapshot = await db.collection('logs').orderBy('timestamp', 'desc').limit(200).get();
++    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as PublicationLog));
++}
++
++export async function addLog(logEntry: Partial<Omit<PublicationLog, 'id' | 'timestamp'>>): Promise<{id: string}> {
++    const db = await getDb();
++    const docRef = db.collection('logs').doc();
++    const newLog: Omit<PublicationLog, 'id'> = {
++      timestamp: new Date().toISOString(),
++      siteName: logEntry.siteName || 'Unknown',
++      articleTitle: logEntry.articleTitle || '...',
++      status: logEntry.status || 'Running',
++      ...logEntry
++    };
++    
++    console.log(`[addLog] ===== SAVING NEW LOG (Firestore) =====`);
++    console.log(`[addLog] ID: "${docRef.id}"`);
++    console.log(`[addLog] ======================================`);
++  
++    await docRef.set(newLog);
++    revalidateAdminPaths(['/admin/logs', '/admin']);
++    return { id: docRef.id };
++}
++
++export async function updateLog(logId: string, updates: Partial<Omit<PublicationLog, 'id'>>) {
++    const db = await getDb();
++    const docRef = db.collection('logs').doc(logId);
++
++    // Create a clean object with no undefined values
++    const cleanUpdates = Object.entries(updates).reduce((acc, [key, value]) => {
++        if (value !== undefined) {
++            (acc as any)[key] = value;
++        }
++        return acc;
++    }, {} as Partial<Omit<PublicationLog, 'id'>>);
++
++
++    console.log(`[updateLog] ===== UPDATING LOG (Firestore) =====`);
++    console.log(`[updateLog] ID: "${logId}"`);
++    console.log(`[updateLog] Updates: ${JSON.stringify(cleanUpdates)}`);
++    console.log(`[updateLog] =====================================`);
++
++    await docRef.update(cleanUpdates);
++    revalidateAdminPaths(['/admin/logs', '/admin']);
++}
++
++
++// --- Flux de publication ---
++
++const publicationFlowInputSchema = z.object({
++  siteId: z.string(),
++  categoryId: z.number().optional(),
++  authorId: z.number().optional(),
++  cronJob: z.boolean().optional(),
++});
++
++function generateTitleHash(title: string): string {
++    const normalizedTitle = title.toLowerCase().trim();
++    return crypto.createHash('md5').update(normalizedTitle).digest('hex');
++}
++
++const articleSchema = z.object({
++    title: z.string(),
++    slug: z.string(),
++    focus_keyword: z.string(),
++    meta_description: z.string(),
++    tags: z.array(z.string()).default([]),
++    internal_links: z.array(z.object({
++        link: z.string(),
++        anchor: z.string()
++    })).optional().default([]),
++    external_links: z.array(z.object({
++        url: z.string(),
++        anchor: z.string()
++    })).optional().default([]),
++    faq: z.array(z.object({
++        question: z.string(),
++        answer: z.string()
++    })).optional().default([])
++});
++
++// --- Helpers pour l'injection de liens externes ---
++
++function escapeRegex(string: string) {
++    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++
++function injectContextualExternalLink(html: string, placeholder: string, anchorHtml: string): string {
++    const placeholderRegex = new RegExp(escapeRegex(placeholder), 'g');
++    return html.replace(placeholderRegex, anchorHtml);
++}
++
++
++export async function runPublicationFlow(values: z.infer<typeof publicationFlowInputSchema>) {
++  const executionId = crypto.randomBytes(16).toString('hex');
++  let site: WordPressSite | undefined;
++  let logId: string | null = null;
++  let articleTitle: string = 'Pending Title...';
++  let titleHash: string | undefined;
++  let selectedCategory: WPCategory | undefined;
++  let selectedAuthor: AuthorProfile | undefined;
++
++  const validation = publicationFlowInputSchema.safeParse(values);
++  if (!validation.success) {
++      throw new Error(`Invalid input for publication flow: ${JSON.stringify(validation.error.issues)}`);
++  }
++  let { siteId, categoryId, authorId, cronJob } = validation.data;
++  
++  console.log(`[EXECUTION ${executionId}] START - Site: ${siteId}`);
++  
++  const lockAcquired = await acquireLock(siteId, executionId);
++  if (!lockAcquired) {
++    return {
++      success: false,
++      siteName: `Site ID ${siteId}`,
++      error: `A publication for this site is already in progress. Please wait a few minutes and try again.`,
++    };
++  }
++  
++  site = await getSite(siteId);
++  const logResult = await addLog({ 
++      siteId, 
++      siteName: site?.name || 'Unknown Site', 
++      articleTitle, 
++      status: 'Running' 
++  });
++  logId = logResult.id;
++
++
++  let injectedInternalLinks: string[] = [];
++
++  try {
++    console.log(`[runPublicationFlow][${executionId}] Step 1: Initializing and fetching settings.`);
++    const settings = await getSettings();
++    const ai = await getInitializedAI();
++
++    if (!settings.selectedModel) {
++      throw new Error('No AI model selected. Please select a model in the admin settings.');
++    }
++    
++    if (!site) {
++        throw new Error(`Site with ID "${siteId}" not found.`);
++    }
++    
++    console.log(`[runPublicationFlow][${executionId}] Step 2: Processing site: ${site.name}`);
++    
++    console.log(`[runPublicationFlow][${executionId}] Step 3: Syncing WordPress data.`);
++    const syncResult = await siteSync(site.id); 
++    if (!syncResult.success || !syncResult.data) {
++        throw new Error(syncResult.error || `Failed to sync WordPress data for site ${site.name}.`);
++    }
++    const { categories } = syncResult.data;
++    const authorProfiles = await getAuthorProfiles(site.id);
++
++    console.log(`[runPublicationFlow][${executionId}] Using ${categories.length} categories and ${authorProfiles.length} authors.`);
++    
++    if (!authorProfiles || authorProfiles.length === 0) {
++        throw new Error('No authors with administrator, editor or author roles found. Please check user permissions.');
++    }
++
++    const uncategorizedNames = ['non classé', 'uncategorized'];
++    const validCategories = categories.filter(category => !uncategorizedNames.includes(category.name.toLowerCase()));
++    
++    if (!validCategories || validCategories.length === 0) {
++        throw new Error('No valid categories found on WordPress site. Please add at least one category other than "Non classé".');
++    }
++    
++    if (cronJob) {
++        if (categoryId === undefined || authorId === undefined) { 
++            throw new Error(`[CRON] Provided category ID ${categoryId} or author ID ${authorId} is invalid.`);
++        }
++        selectedCategory = validCategories.find(c => c.id === categoryId);
++        selectedAuthor = authorProfiles.find(a => a.id === authorId);
++
++        if (!selectedCategory) throw new Error(`[CRON] Provided category ID ${categoryId} is invalid or not found for site.`);
++        if (!selectedAuthor) throw new Error(`[CRON] Provided author ID ${authorId} is invalid or not found for site.`);
++        console.log(`[CRON] Using provided category: "${selectedCategory.name}"`);
++        console.log(`[CRON] Using provided author: "${selectedAuthor.name}"`);
++    } else { 
++        const allLogs = await getLogs();
++        const siteLogs = allLogs.filter(log => log.siteId === site!.id && log.status === 'Success');
++        
++        let nextCategoryIndex = 0;
++        const lastCategoryLog = siteLogs.find(log => log.categoryId);
++        if (lastCategoryLog?.categoryId) {
++            const lastCatIndex = validCategories.findIndex(c => c.id === lastCategoryLog.categoryId);
++            if(lastCatIndex !== -1) {
++                nextCategoryIndex = (lastCatIndex + 1) % validCategories.length;
++            }
++        }
++        selectedCategory = validCategories[nextCategoryIndex];
++        console.log(`[MANUAL] Sequentially selected category: "${selectedCategory.name}"`);
++
++        selectedAuthor = authorProfiles[Math.floor(Math.random() * authorProfiles.length)];
++        console.log(`[MANUAL] Randomly selected author: "${selectedAuthor.name}"`);
++    }
++
++    if (!selectedCategory || !selectedAuthor) {
++        throw new Error("Could not determine a category or author to publish with.");
++    }
++    
++    const allLogs = await getLogs();
++    const publishedHashes = new Set(allLogs.filter(log => log.status === 'Success').map(log => log.titleHash).filter(Boolean));
++    
++    let authorPrompt = '';
++    if (selectedAuthor?.customPrompt) {
++        authorPrompt = `INSTRUCTION D'AUTEUR PRIORITAIRE : Le style de rédaction doit impérativement suivre cette directive : "${selectedAuthor.customPrompt}"`;
++    } else if (site.customPrompt) {
++        authorPrompt = `CONTEXTE GÉNÉRAL DU SITE : Les instructions suivantes for ce site doivent être prises en compte : "${site.customPrompt}"`;
++    }
++      
++    console.log(`[runPublicationFlow][${executionId}] Step 4a: Generating initial article metadata.`);
++    const topicIdeaPrompt = `Trouve une idée de sujet d'article de blog originale, spécifique et non-générique pour la niche "${site.niche}" et la catégorie "${selectedCategory.name}". L'idée doit permettre de créer un contenu à forte valeur ajoutée, digne d'un expert.`;
++    const topicResponse = await ai.generate({ model: googleAI.model(settings.selectedModel as any), prompt: topicIdeaPrompt });
++    const topicIdea = topicResponse.text;
++
++    const ragContent = await findRelevantContent(topicIdea, site.id);
++    let internalLinkingContext = '';
++    
++    if (ragContent.success && ragContent.results && ragContent.results.length > 0) {
++        internalLinkingContext = `
++        CONTEXTE (MAILLAGE INTERNE) : Voici une liste d'articles pertinents déjà publiés sur le site. Tu DOIS sélectionner 2 ou 3 des plus pertinents pour le sujet à traiter et les utiliser pour créer des liens internes. Tu dois utiliser EXACTEMENT les URLs fournies.
++        ${JSON.stringify(ragContent.results.map(r => ({ title: r.metadata?.title, url: r.metadata?.url, content: r.content[0].text })), null, 2)}
++        `;
++    } else {
++        console.log('[RAG] No relevant content found for internal linking. Article will be published without internal links.');
++    }
++    
++    let searchQueries: string[] = [];
++    if (settings.googleCseApiKey && settings.googleCseId) {
++        const queryGenPrompt = `Génère 3 requêtes de recherche Google très spécifiques pour trouver des sources externes faisant autorité (études scientifiques, articles de fond, rapports gouvernementaux, analyses de marché) for un article sur le sujet : "${topicIdea}". Format de sortie : liste JSON ["requête 1", "requête 2", "requête 3"].`;
++        try {
++            const queryGenResponse = await ai.generate({ model: googleAI.model(settings.selectedModel as any), prompt: queryGenPrompt });
++            const jsonBlock = tryParseJsonBlock(queryGenResponse.text);
++            if (jsonBlock) {
++                const parsed = JSON.parse(jsonBlock);
++                if (Array.isArray(parsed)) {
++                    searchQueries = parsed.filter((query: unknown) => typeof query === 'string');
++                }
++            }
++        } catch(e) {
++            console.warn('[External Link] Failed to generate search queries from AI, proceeding without them.');
++        }
++    }
++
++    let searchResults: { link: string; title: string; snippet: string }[] = [];
++    if (searchQueries.length > 0 && settings.googleCseApiKey && settings.googleCseId) {
++        for (const query of searchQueries) {
++             try {
++                console.log(`[External Link] Searching Google for: "${query}"`);
++                const searchUrl = `https://www.googleapis.com/customsearch/v1?key=${settings.googleCseApiKey}&cx=${settings.googleCseId}&q=${encodeURIComponent(query)}&num=2`;
++                const searchResponse = await fetch(searchUrl, { cache: 'no-store' });
++                if (searchResponse.ok) {
++                    const results = await searchResponse.json();
++                    if (results.items) {
++                        searchResults.push(...results.items.map((item: any) => ({
++                            link: item.link,
++                            title: item.title,
++                            snippet: item.snippet
++                        })));
++                    }
++                }
++            } catch (e: any) {
++                console.warn(`[External Link Search] Failed to fetch for query "${query}": ${e.message}`);
++            }
++        }
++    }
++    
++    let externalLinksContext = '';
++    if (searchResults.length > 0) {
++        externalLinksContext = `
++        SOURCES EXTERNES POTENTIELLES : Voici une liste de sources externes trouvées sur Google. Tu DOIS en choisir 3 qui sont les plus fiables et pertinentes pour l'article (privilégie les études scientifiques, les sites gouvernementaux, les médias reconnus).
++        ${JSON.stringify(searchResults, null, 2)}
++        `;
++    }
++
++    console.log(`[runPublicationFlow][${executionId}] Step 4c: Generating enriched content metadata (links, FAQ).`);
++    const metadataPrompt = `
++    RÔLE: Tu es un stratège de contenu SEO d'élite et un expert dans la niche '${site.niche}'.
++    MISSION: Générer un plan de contenu complet et des méta-données pour un article de blog à très forte valeur ajoutée.
++    IDÉE DE SUJET : "${topicIdea}"
++    CATÉGORIE IMPOSÉE : "${selectedCategory.name}"
++    ${authorPrompt}
++    ${internalLinkingContext}
++    ${externalLinksContext}
++    INSTRUCTIONS :
++    1.  **TITRE ACCROCHEUR** Crée un titre percutant de moins de 60 caractères.
++    2.  **MÉTA-DONNÉES SEO**:
++        -   **slug**: 3-5 mots clés, en kebab-case.
++        -   **focus_keyword**: La requête de longue traîne que tu cibles.
++        -   **meta_description**: 150-160 caractères, engageante.
++        -   **tags**: 5 tags spécifiques.
++    3.  **PLAN DE CONTENU**:
++        -   **internal_links**: ${internalLinkingContext ? "En te basant sur le CONTEXTE (MAILLAGE INTERNE), sélectionne les 2 articles les plus pertinents et propose un texte d'ancre naturel pour chacun. Tu dois utiliser l'URL exacte du catalogue." : "Ne pas générer de liens internes."}
++        -   **external_links**: ${externalLinksContext ? "À partir de la liste de SOURCES EXTERNES, choisis les 3 sources les plus fiables. Pour chacune, génère un texte d'ancre naturel." : "Ne pas générer de liens externes."}
++        -   **faq**: 3 questions très spécifiques sur le sujet.
++    4.  **FORMAT DE SORTIE (JSON STRICT)**: Tu dois impérativement retourner un bloc de code JSON valide.
++        \`\`\`json
++        {
++            "title": "string",
++            "slug": "string",
++            "focus_keyword": "string",
++            "meta_description": "string",
++            "tags": ["string"],
++            "internal_links": [ { "link": "string", "anchor": "string" } ],
++            "external_links": [ { "url": "string", "anchor": "string" } ],
++            "faq": [{"question": "string", "answer": "string"}]
++        }
++        \`\`\`
++    `;
++
++    let metadataResponse = await ai.generate({ model: googleAI.model(settings.selectedModel as any), prompt: metadataPrompt });
++    let rawText = metadataResponse.text;
++     if (!rawText) throw new Error('Article plan generation returned an empty response.');
++
++    let article: any;
++    const jsonBlock = tryParseJsonBlock(rawText);
++    if (!jsonBlock) {
++        console.error(`[${executionId}] Raw article plan response was:`, rawText);
++        throw new Error('No valid JSON block found in the article plan response.');
++    }
++
++    try {
++        article = articleSchema.parse(JSON.parse(jsonBlock));
++    } catch (e: any) {
++        console.error(`[${executionId}] Failed to parse JSON from article plan response:`, e.message);
++        throw new Error(`Failed to parse JSON from article plan response: ${e.message}`);
++    }
++    
++    articleTitle = article.title;
++    console.log(`[runPublicationFlow][${executionId}] AI chose topic: "${article.title}" for category "${selectedCategory.name}"`);
++    await updateLog(logId, { articleTitle });
++    
++    console.log(`[runPublicationFlow][${executionId}] Generated slug: ${article.slug}`);
++
++    titleHash = generateTitleHash(article.title);
++    if (publishedHashes.has(titleHash)) {
++        throw new Error(`Generated article title "${article.title}" is a duplicate. Halting publication.`);
++    }
++
++    console.log(`[runPublicationFlow][${executionId}] Step 4d: Generating article content.`);
++
++    const internalLinksInstruction = (article.internal_links && article.internal_links.length > 0)
++    ? `MAILLAGE INTERNE OBLIGATOIRE : Intègre les placeholders suivants DANS des phrases complètes, là où c'est le plus pertinent. Exemple: '...comme nous l'avons vu dans notre guide sur [INTERNAL_LINK_1].'. Placeholders : ${article.internal_links.map((_: any, i: number) => `[INTERNAL_LINK_${i + 1}]`).join(', ')}.`
++    : "MAILLAGE INTERNE : Ne pas insérer de placeholders.";
++    
++    const externalLinksInstruction = (article.external_links && article.external_links.length > 0)
++    ? `LIENS EXTERNES OBLIGATOIRES : Tu DOIS intégrer les placeholders suivants de manière naturelle dans des phrases complètes. Exemple : 'Pour en savoir plus, consultez les recommandations sur [EXTERNAL_LINK_1].'. Placeholders : ${article.external_links.map((_: any, i: number) => `[EXTERNAL_LINK_${i + 1}]`).join(', ')}.`
++    : "LIENS EXTERNES : Ne pas insérer de placeholders.";
++
++    const contentPrompt = `
++        RÔLE: Tu es un rédacteur expert et un pédagogue reconnu dans la niche '${site.niche}'.
++        ${authorPrompt}
++        MISSION: Rédiger un article HTML complet et approfondi (minimum 1500 mots) basé sur le plan suivant.
++        - TITRE: "${article.title}"
++        - SUJET: Développer en profondeur le sujet du titre, en restant dans la catégorie '${selectedCategory.name}'.
++        STRUCTURE & CONTENU (NON NÉGOCIABLE):
++        1.  **INTRODUCTION ACCROCHEUSE**: Capte l'attention avec une anecdote ou une question.
++        2.  **DÉVELOPPEMENT "PROBLÈME -> SOLUTION -> PREUVE"**: Explique, propose des solutions, prouve leur efficacité. Varie les angles et les exemples pour éviter les répétitions.
++        3.  **ENCADRÉS "VALEUR AJOUTÉE"**: Intègre au moins un encadré &lt;div class="expert-box"&gt; (ex: L'AVIS DE L'EXPERT, MYTHE VS RÉALITÉ).
++        4.  **TON ET STYLE**: ${site.customPrompt ? 'Défini par les instructions du site' : 'Expert mais accessible'}. Adresse-toi directement au lecteur ("vous").
++        5.  **FORMAT HTML STRICT**:
++            -   Langue: Français impeccable, précis, sans phrases creuses.
++            -   Utilise des balises sémantiques (&lt;h2&gt;, &lt;h3&gt;, &lt;ul&gt;, &lt;li&gt;, &lt;strong&gt;, &lt;blockquote&gt;). JAMAIS de &lt;h1&gt;.
++            -   N'insère AUCUN lien hypertexte (&lt;a&gt;) toi-même, sauf les placeholders fournis.
++            -   ${internalLinksInstruction}
++            -   ${externalLinksInstruction}
++            -   Insère le placeholder \`[YOUTUBE_VIDEO]\` dans une phrase pertinente.
++        6.  **SECTION FAQ**: Termine avec une section &lt;h2&gt;Questions Fréquentes (FAQ)&lt;/h2&gt; reprenant les Q/R du plan, en utilisant la structure &lt;details&gt;&lt;summary&gt;QUESTION&lt;/summary&gt;&lt;p&gt;RÉPONSE&lt;/p&gt;&lt;/details&gt;. Les réponses doivent être concrètes, avec des détails utiles. Place [FAQ_SCHEMA_JSON_LD] après la dernière balise.
++        FORMAT DE SORTIE: Retourne **uniquement** le code HTML brut de l'article.
++    `;
++
++    const contentResponse = await ai.generate({ model: googleAI.model(settings.selectedModel as any), prompt: contentPrompt });
++    let htmlContent = contentResponse.text;
++    
++    if (!htmlContent) {
++        throw new Error('Content generation returned an empty response.');
++    }
++    
++    htmlContent = decodeHtmlEntities(htmlContent);
++    htmlContent = htmlContent.replace(/^```html\s*/, '').replace(/```\s*$/, '');
++    
++    console.log(`[runPublicationFlow][${executionId}] Step 5: Enriching content with media and structured data.`);
++    let finalHtmlContent = htmlContent;
++
++    if (article.internal_links && article.internal_links.length > 0) {
++        article.internal_links.forEach((link: { link: string; anchor: string }, i: number) => {
++            const placeholder = `[INTERNAL_LINK_${i + 1}]`;
++            if (finalHtmlContent.includes(placeholder)) {
++                const anchorText = decodeHtmlEntities(link.anchor);
++                const anchorTag = `<a href="${link.link}" rel="noopener" class="internal-link" title="${anchorText}">${anchorText}</a>`;
++                finalHtmlContent = finalHtmlContent.replace(placeholder, anchorTag);
++                injectedInternalLinks.push(link.link);
++            }
++        });
++    }
++
++    const faqPlaceholder = '[FAQ_SCHEMA_JSON_LD]';
++    if (finalHtmlContent.includes(faqPlaceholder) && article.faq && Array.isArray(article.faq) && article.faq.length > 0) {
++        const faqItems = article.faq.map((item: any) => ({
++            "@type": "Question",
++            "name": item.question,
++            "acceptedAnswer": { "@type": "Answer", "text": item.answer }
++        }));
++        const schemaObject = {
++            "@context": "https://schema.org",
++            "@type": "FAQPage",
++            "mainEntity": faqItems,
++        };
++        const faqSchema = `<script type="application/ld+json">${JSON.stringify(schemaObject)}</script>`;
++        finalHtmlContent = finalHtmlContent.replace(faqPlaceholder, faqSchema);
++    } else {
++        finalHtmlContent = finalHtmlContent.replace(faqPlaceholder, '');
++    }
++
++     if (article.external_links && Array.isArray(article.external_links)) {
++        article.external_links.forEach((linkData: { url: string, anchor: string }, i: number) => {
++            const placeholder = `[EXTERNAL_LINK_${i + 1}]`;
++            if (finalHtmlContent.includes(placeholder)) {
++                const anchorText = decodeHtmlEntities(linkData.anchor);
++                const linkHtml = `<a href="${linkData.url}" target="_blank" rel="noopener noreferrer nofollow">${anchorText}</a>`;
++                finalHtmlContent = injectContextualExternalLink(finalHtmlContent, placeholder, linkHtml);
++            }
++        });
++    }
++    
++    finalHtmlContent = finalHtmlContent.replace(/\[EXTERNAL_LINK_\d+\]/g, '');
++
++    try {
++        if (settings.youtubeApiKey) {
++            const youtubeQuery = `${site.niche} ${selectedCategory.name} ${article.title}`;
++            console.log(`[runPublicationFlow][${executionId}] Searching YouTube for video with query: "${youtubeQuery}"`);
++            const youtubeResponse = await fetch(`https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(youtubeQuery)}&type=video&maxResults=1&relevanceLanguage=fr&key=${settings.youtubeApiKey}`, { cache: 'no-store' });
++            if (youtubeResponse.ok) {
++                const youtubeData = await youtubeResponse.json();
++                if (youtubeData.items && youtubeData.items.length > 0) {
++                    const videoId = youtubeData.items[0].id.videoId;
++                    console.log(`[runPublicationFlow][${executionId}] Found YouTube video ID: ${videoId}. Embedding it.`);
++                    const videoEmbed = `<div style="margin: 2em 0; position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden;"><iframe style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;" src="https://www.youtube.com/embed/${videoId}" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`;
++                    finalHtmlContent = finalHtmlContent.replace('[YOUTUBE_VIDEO]', videoEmbed);
++                } else {
++                    console.log(`[runPublicationFlow][${executionId}] No YouTube video found.`);
++                }
++            }
++        }
++    } catch(e: any) {
++        console.warn(`[YouTube] Failed to process video. This is not critical. ${e.message}`);
++    }
++
++    finalHtmlContent = finalHtmlContent.replace(/\[YOUTUBE_VIDEO\]/g, '');
++    finalHtmlContent = finalHtmlContent.replace(/\[BODY_IMAGE_\d+\]/g, '');
++    finalHtmlContent = finalHtmlContent.replace(/\[INTERNAL_LINK_\d+\]/g, '');
++
++    console.log(`[runPublicationFlow][${executionId}] Step 6: Publishing to WordPress.`);
++    const wordCount = finalHtmlContent.replace(/<[^>]*>/g, '').split(/\s+/).length;
++
++    const postData: any = {
++      title: article.title,
++      slug: article.slug,
++      content: finalHtmlContent,
++      status: 'publish',
++      author: selectedAuthor.id,
++      categories: [selectedCategory.id],
++      meta: {
++        _yoast_wpseo_title: article.title,
++        _yoast_wpseo_metadesc: article.meta_description,
++        _yoast_wpseo_focuskw: article.focus_keyword,
++      }
++    };
++    
++    const publishUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts`;
++    const publishResponse = await fetch(publishUrl, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        'Authorization': `Basic ${Buffer.from(`${site.username}:${site.applicationPassword}`).toString('base64')}`
++      },
++      body: JSON.stringify(postData)
++    });
++
++    if (!publishResponse.ok) {
++      const errorBody = await safeParseJsonResponse(publishResponse);
++      throw new Error(`Failed to publish post: ${publishResponse.statusText} - ${errorBody?.message || 'Unknown error'}`);
++    }
++
++    const publishedPost = await publishResponse.json();
++    console.log(`[runPublicationFlow][${executionId}] Post published successfully. URL: ${publishedPost.link}`);
++
++    console.log(`[runPublicationFlow][${executionId}] Step 7: Creating/Assigning tags.`);
++    if (article.tags && Array.isArray(article.tags) && article.tags.length > 0) {
++        const tagsToFetch = article.tags.join(',');
++        let existingTags: any[] = [];
++        if (tagsToFetch) {
++            try {
++                const tagsUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/tags?search=${encodeURIComponent(tagsToFetch)}&per_page=100`;
++                const tagsResponse = await fetch(tagsUrl, {
++                headers: { 'Authorization': `Basic ${Buffer.from(`${site.username}:${site.applicationPassword}`).toString('base64')}` }
++                });
++                if (tagsResponse.ok) existingTags = await tagsResponse.json();
++            } catch (e: any) {
++                console.warn(`[runPublicationFlow][${executionId}] Failed to fetch existing tags: ${e.message}`);
++            }
++        }
++        
++        const existingTagNames = new Set(existingTags.map((t: any) => t.name.toLowerCase()));
++        const newTagsToCreate = article.tags.filter((t: any) => t && !existingTagNames.has(t.toLowerCase()));
++
++        let newTagIds: number[] = [];
++        if (newTagsToCreate.length > 0) {
++          console.log(`[runPublicationFlow][${executionId}] Creating new tags: ${newTagsToCreate.join(', ')}`);
++          for (const tagName of newTagsToCreate) {
++             if (!tagName) continue;
++             try {
++                const createTagUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/tags`;
++                const createTagResponse = await fetch(createTagUrl, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${Buffer.from(`${site.username}:${site.applicationPassword}`).toString('base64')}` },
++                body: JSON.stringify({ name: tagName })
++                });
++                if (createTagResponse.ok) newTagIds.push((await createTagResponse.json()).id);
++             } catch (e: any) {
++                console.warn(`[runPublicationFlow][${executionId}] Failed to create tag "${tagName}": ${e.message}`);
++             }
++          }
++        }
++
++        const allTagIds = [...existingTags.map((t: any) => t.id), ...newTagIds];
++
++        if (allTagIds.length > 0) {
++            try {
++                console.log(`[runPublicationFlow][${executionId}] Assigning tags to post: ${allTagIds.join(', ')}`);
++                const assignTagsUrl = `${site.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts/${publishedPost.id}`;
++                await fetch(assignTagsUrl, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${Buffer.from(`${site.username}:${site.applicationPassword}`).toString('base64')}` },
++                    body: JSON.stringify({ tags: allTagIds })
++                });
++            } catch (e: any) {
++                console.warn(`[runPublicationFlow][${executionId}] Failed to assign tags: ${e.message}`);
++            }
++        }
++    }
++
++    console.log(`[runPublicationFlow][${executionId}] Step 8: Logging success.`);
++    if (logId) {
++        await updateLog(logId, {
++            status: 'Success',
++            url: publishedPost.link,
++            wordCount,
++            titleHash,
++            categoryId: selectedCategory.id,
++            authorId: selectedAuthor.id,
++            internalLinks: injectedInternalLinks
++        });
++    }
++
++    console.log(`[EXECUTION ${executionId}] END - Success`);
++    
++    return {
++      success: true,
++      siteName: site.name,
++      articleUrl: publishedPost.link,
++      wordCount,
++      articleTitle: article.title,
++      auditReport: '',
++    };
++
++  } catch (error: any) {
++    console.error(`[runPublicationFlow][${executionId}] ERROR: Publication flow failed for ${site?.name}: ${error.message}`);
++    const errorMessage = error instanceof Error ? error.message : String(error);
++
++    if (logId) {
++        await updateLog(logId, {
++            status: 'Failed', error: errorMessage, articleTitle,
++            categoryId: selectedCategory?.id,
++            authorId: selectedAuthor?.id,
++            titleHash: titleHash,
++        });
++    }
++    
++    console.log(`[EXECUTION ${executionId}] END - Failure`);
++    return { success: false, siteName: site?.name || 'Unknown Site', error: errorMessage };
++  } finally {
++    if (site?.id) await releaseLock(site.id, executionId);
++  }
++}
++
++function readSiteStateFor(siteId: string, stateData: any) {
++  const legacyIdx = (stateData as any)?.nextCategoryIndex;
++  const siteState = (stateData.sites || {})[siteId] || null;
++  return {
++    nextCategoryIndex: (typeof siteState?.nextCategoryIndex === 'number')
++      ? siteState.nextCategoryIndex
++      : (typeof legacyIdx === 'number' ? legacyIdx : 0),
++    siteState: siteState || { nextCategoryIndex: 0, lastAttemptAt: null, lastResult: 'success', lastError: null }
++  };
++}
++
++export async function runAutoPublishingCycle() {
++  console.log('[CRON] Auto-publishing cycle STARTED.');
++  try {
++    const allSites = await getSites();
++    const activeSites = allSites.filter(site => site.isActive);
++
++    if (activeSites.length === 0) {
++      console.log('[CRON] Auto-publishing cycle FINISHED: No active sites.');
++      return { success: true, message: 'No active sites to publish to.' };
++    }
++    console.log(`[CRON] Found ${activeSites.length} active sites.`);
++
++    const stateData = await getPublicationState();
++    console.log(`[CRON] Loaded state from Firestore:`, JSON.stringify(stateData, null, 2));
++
++    let currentSiteIndex = 0;
++    if (stateData.currentSiteId) {
++      const lastIndex = activeSites.findIndex(s => s.id === stateData.currentSiteId);
++      if (lastIndex !== -1) currentSiteIndex = lastIndex;
++    } else {
++      await updatePublicationState({ currentSiteId: activeSites[0].id });
++    }
++    
++    let siteToPublish = activeSites[currentSiteIndex];
++    console.log(`[CRON] Current site for publication: ${siteToPublish.name}`);
++
++    let { nextCategoryIndex } = readSiteStateFor(siteToPublish.id, stateData);
++    
++    const syncResult = await siteSync(siteToPublish.id);
++    if (!syncResult.success || !syncResult.data) {
++      throw new Error(`[CRON] Failed to sync data for site ${siteToPublish.name}: ${syncResult.error}`);
++    }
++    
++    const uncategorizedNames = ['non classé', 'uncategorized'];
++    let validCategories = syncResult.data.categories
++      .filter(c => !uncategorizedNames.includes(c.name.toLowerCase()))
++      .sort((a, b) => a.id - b.id);
++    let authorProfiles = await getAuthorProfiles(siteToPublish.id);
++
++    if (validCategories.length === 0) throw new Error(`[CRON] No valid categories found for site ${siteToPublish.name}.`);
++    if (authorProfiles.length === 0) throw new Error(`[CRON] No authors found for site ${siteToPublish.name}.`);
++
++    if (nextCategoryIndex >= validCategories.length) {
++        console.log(`[CRON] All categories published for site "${siteToPublish.name}". Moving to the next site.`);
++        nextCategoryIndex = 0;
++        currentSiteIndex = (currentSiteIndex + 1) % activeSites.length;
++        siteToPublish = activeSites[currentSiteIndex];
++        console.log(`[CRON] New site is "${siteToPublish.name}".`);
++        
++        const newSyncResult = await siteSync(siteToPublish.id);
++        if (!newSyncResult.success || !newSyncResult.data) {
++          throw new Error(`[CRON] Failed to sync data for NEW site ${siteToPublish.name}: ${newSyncResult.error}`);
++        }
++        validCategories = newSyncResult.data.categories
++            .filter(c => !uncategorizedNames.includes(c.name.toLowerCase()))
++            .sort((a, b) => a.id - b.id);
++        authorProfiles = await getAuthorProfiles(siteToPublish.id);
++
++        if (validCategories.length === 0) throw new Error(`[CRON] No valid categories on NEW site ${siteToPublish.name}.`);
++        if (authorProfiles.length === 0) throw new Error(`[CRON] No authors on NEW site ${siteToPublish.name}.`);
++
++        ({ nextCategoryIndex } = readSiteStateFor(siteToPublish.id, stateData));
++        console.log(`[CRON] after rotation → site=${siteToPublish.name}, nextCategoryIndex=${nextCategoryIndex}`);
++    }
++    
++    const categoryToPublish = validCategories[nextCategoryIndex];
++    const authorToPublish = authorProfiles[Math.floor(Math.random() * authorProfiles.length)];
++    
++    if (!categoryToPublish || !authorToPublish) {
++        throw new Error(`[CRON] Could not determine a category or author to publish with.`);
++    }
++
++    const result = await runPublicationFlow({
++      siteId: siteToPublish.id,
++      cronJob: true,
++      categoryId: categoryToPublish.id,
++      authorId: authorToPublish.id
++    });
++    
++    const advancedCategoryIndex = nextCategoryIndex + 1;
++    let nextSiteIndexComputed = currentSiteIndex;
++    let nextCategoryIndexPersisted = advancedCategoryIndex;
++
++    if (advancedCategoryIndex >= validCategories.length) {
++      nextCategoryIndexPersisted = 0;
++      nextSiteIndexComputed = (currentSiteIndex + 1) % activeSites.length;
++    }
++    
++    const safeLastError = result.success ? null : (result.error || '');
++    const { siteState } = readSiteStateFor(siteToPublish.id, stateData);
++
++    const newState: any = {
++      currentSiteId: activeSites[nextSiteIndexComputed].id,
++      sites: {
++        ...(stateData.sites || {}),
++        [siteToPublish.id]: {
++          ...(siteState || {}),
++          nextCategoryIndex: nextCategoryIndexPersisted,
++          lastAttemptAt: new Date().toISOString(),
++          lastResult: result.success ? 'success' : 'failed',
++          lastError: safeLastError
++        }
++      }
++    };
++    
++    await updatePublicationState(newState);
++    console.log(`[CRON] State updated (advance pointer) → site=${activeSites[nextSiteIndexComputed].name}, nextCategoryIndex=${nextCategoryIndexPersisted}`);
++
++    if (!result.success) {
++      console.error(`[CRON] Publishing cycle failed for site ${result.siteName}. Error: ${result.error}. State advanced anyway.`);
++    } else {
++        console.log(`[CRON] Publishing cycle successful. Article: "${result.articleTitle}" on site "${result.siteName}".`);
++    }
++
++    return result;
++
++  } catch (error: any) {
++    console.error(`[CRON] Auto-publishing cycle failed with an unhandled exception: ${error.message}`);
++    await addLog({
++      siteId: 'system',
++      siteName: 'System Cron',
++      articleTitle: 'Cron Job Execution Failure',
++      status: 'Failed',
++      error: error.message || 'An unknown error occurred in the auto-publishing cycle.',
++    });
++    return { success: false, error: error.message };
++  }
++}
+ 
+EOF
+)
